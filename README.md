@@ -91,6 +91,101 @@ sudo systemctl enable --now mld-proxy.service
 | `REFRESH_INTERVAL` | 60 秒 | 全グループの MLD Report を再送信する間隔 |
 | `EXPIRY_CHECK_INTERVAL` | 30 秒 | 期限切れチェックの実行間隔 |
 
+## UniFi Dream Machine Pro でのデーモン化
+
+UDM-Pro は再起動やファームウェア更新でカスタム設定が失われるため、[unifios-utilities](https://github.com/unifi-utilities/unifios-utilities) の `on-boot-script` を使用して永続化する。
+
+### 1. on-boot-script のインストール
+
+UDM-Pro に SSH 接続し、以下を実行:
+
+```bash
+curl -fsL "https://raw.githubusercontent.com/unifi-utilities/unifios-utilities/HEAD/on-boot-script/remote_install.sh" | /bin/bash
+```
+
+これにより `/data/on_boot.d/` に配置したスクリプトが起動時に自動実行されるようになる。
+
+### 2. スクリプトの配置
+
+```bash
+# スクリプトを /data に配置
+mkdir -p /data/mld-proxy
+curl -o /data/mld-proxy/mld_proxy.py https://raw.githubusercontent.com/<your-repo>/mld_proxy.py
+chmod +x /data/mld-proxy/mld_proxy.py
+```
+
+### 3. 起動スクリプトの作成
+
+```bash
+cat > /data/on_boot.d/10-mld-proxy.sh << 'EOF'
+#!/bin/bash
+
+SCRIPT_PATH="/data/mld-proxy/mld_proxy.py"
+UPSTREAM_IF="eth9"      # WAN 側インターフェース
+DOWNSTREAM_IF="br0"     # LAN 側インターフェース
+PID_FILE="/run/mld-proxy.pid"
+LOG_FILE="/var/log/mld-proxy.log"
+
+# 既存プロセスの停止
+if [ -f "$PID_FILE" ]; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null
+    rm -f "$PID_FILE"
+fi
+
+# バックグラウンドで起動
+nohup python3 "$SCRIPT_PATH" "$UPSTREAM_IF" "$DOWNSTREAM_IF" >> "$LOG_FILE" 2>&1 &
+echo $! > "$PID_FILE"
+
+echo "MLD Proxy started (PID: $(cat $PID_FILE))"
+EOF
+
+chmod +x /data/on_boot.d/10-mld-proxy.sh
+```
+
+### 4. 動作確認
+
+```bash
+# 手動で起動スクリプトを実行
+/data/on_boot.d/10-mld-proxy.sh
+
+# ログを確認
+tail -f /var/log/mld-proxy.log
+
+# プロセスの確認
+ps aux | grep mld_proxy
+```
+
+### 5. インターフェース名の確認
+
+UDM-Pro のインターフェース名は環境により異なる場合がある。以下で確認:
+
+```bash
+ip link show
+```
+
+一般的な構成:
+- WAN: `eth8` または `eth9`
+- LAN (ブリッジ): `br0`
+
+### 注意事項
+
+- `/data` ディレクトリはファームウェア更新後も保持される
+- on-boot-script は UniFi OS コンテナ起動後に実行されるため、ネットワークインターフェースは利用可能な状態
+- ファームウェアのメジャーアップデート後は on-boot-script の再インストールが必要な場合がある
+
+### トラブルシューティング
+
+```bash
+# サービスの状態確認
+systemctl status udm-boot
+
+# on-boot-script のログ確認
+journalctl -u udm-boot
+
+# MLD Proxy を手動停止
+kill "$(cat /run/mld-proxy.pid)"
+```
+
 ## 制限事項
 
 - link-local アドレス (`fe80::/10`) は対象外（Solicited-Node の proxy は不要なため）
