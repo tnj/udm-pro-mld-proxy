@@ -22,13 +22,41 @@ IPv6 ルーターで WAN の /64 prefix を LAN に配布し、ndppd で NDP pro
  [LAN hosts]   SLAAC でアドレス取得
 ```
 
+## UDM-Pro の IPv6 設定
+
+UDM-Pro の管理画面で、Internet (WAN1) の IPv6 Configuration を以下のように設定する:
+
+- **IPv6 Connection**: SLAAC
+- **Prefix Delegation Size**: Single Network
+- **Assign to Network**: Default (または使用する Network)
+
+この設定により、UDM-Pro 内蔵の NDP Proxy (ndppd) が有効になり、NS/NA が WAN と選択した Network の間で転送される。クライアントは SLAAC で WAN 側と同一 prefix のアドレスを取得できる。
+
+### MLD Snooping による問題
+
+NDP Proxy だけでは、Network 側でクライアントが参加する Solicited-Node マルチキャストアドレスに、WAN 側では誰も参加していない状態となる。
+
+WAN Gateway が MLD Snooping を行っている場合（SONY NURO 光 NSD-G1000T など）、以下の問題が発生する:
+
+1. WAN Gateway が NDP キャッシュを更新するために Solicited-Node マルチキャストアドレス宛に NS を送信
+2. MLD Snooping により、そのマルチキャストグループのメンバーがいないため NS がどこにも転送されない
+3. NS が届かないため NA が返らず、WAN Gateway の NDP キャッシュからエントリが削除される
+4. 結果として通信が途絶える
+
+### 本スクリプトによる解決
+
+本スクリプトは Network 側での DAD/NA を監視し、対応する Solicited-Node マルチキャストグループに WAN 側で参加する。これにより:
+
+1. WAN Gateway が NS を UDM-Pro に転送できるようになる
+2. UDM-Pro の NDP Proxy が NS を受信し NA を返す
+3. 接続が維持される
+
 ## 動作原理
 
 1. br0 上の NS (DAD を含む) と NA を raw socket で監視
 2. LAN hosts の IPv6 アドレスから Solicited-Node マルチキャストアドレス (`ff02::1:ffXX:XXXX`) を算出
 3. eth9 でそのマルチキャストグループにカーネルレベルで参加 (`IPV6_JOIN_GROUP`)
-4. eth9 から MLDv2 Report を送信し、WAN Gateway に通知
-5. 60 秒ごとに全グループの MLD Report を再送信
+4. カーネルが自動的に MLDv2 Report を送信し、MLD Query にも応答する
 
 これにより、WAN Gateway は eth9 を該当グループのメンバーとして認識し、NS を eth9 に転送する。ndppd がその NS を受信して NA を返すことで、LAN hosts の Neighbor Discovery が正常に機能する。
 
@@ -56,10 +84,8 @@ sudo python3 mld_proxy.py eth9 br0
 ```
 MLD Proxy: br0 -> eth9
 Listening for NDP on downstream...
-Sent MLD Join: ff02::1:ff12:3456 on eth9
-Sent MLD Join: ff02::1:ff78:9abc on eth9
-Sent MLD Report: ff02::1:ff12:3456 on eth9
-Sent MLD Report: ff02::1:ff78:9abc on eth9
+Joined: ff02::1:ff12:3456 on eth9
+Joined: ff02::1:ff78:9abc on eth9
 ```
 
 ## systemd でのデーモン化
@@ -88,7 +114,6 @@ sudo systemctl enable --now mld-proxy.service
 | パラメータ | デフォルト | 説明 |
 |-----------|-----------|------|
 | `ADDR_TIMEOUT` | 300 秒 | NDP トラフィックが観測されないアドレスを期限切れとする時間 |
-| `REFRESH_INTERVAL` | 60 秒 | 全グループの MLD Report を再送信する間隔 |
 | `EXPIRY_CHECK_INTERVAL` | 30 秒 | 期限切れチェックの実行間隔 |
 
 ## UniFi Dream Machine Pro でのデーモン化
@@ -189,4 +214,3 @@ kill "$(cat /run/mld-proxy.pid)"
 ## 制限事項
 
 - link-local アドレス (`fe80::/10`) は対象外（Solicited-Node の proxy は不要なため）
-- MLD Report に Router Alert オプションを付加していない。一般的な MLD Snooping 実装では問題ないが、厳密な RFC 準拠が求められる環境では注意が必要

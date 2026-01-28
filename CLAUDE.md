@@ -17,10 +17,9 @@ Requires root privileges and Python 3.6+. No external dependencies — uses only
 
 ## Architecture
 
-The `MLDProxy` class does three things:
+The `MLDProxy` class does two things:
 
 1. **NDP monitoring** — Listens on the downstream interface (e.g., `br0`) via a raw ICMPv6 socket filtered to NS/NA packets. Extracts target IPv6 addresses from NDP messages.
-2. **Multicast group management** — For each discovered address, computes the Solicited-Node multicast address (`ff02::1:ffXX:XXXX`) and joins the group on the upstream interface via `IPV6_JOIN_GROUP`. Tracks address freshness and expires stale entries after `ADDR_TIMEOUT` (300s).
-3. **MLD Report sending** — Sends MLDv2 Reports on the upstream interface to notify the gateway. Periodically refreshes all group memberships every `REFRESH_INTERVAL` (60s). Sends leave messages (CHANGE_TO_INCLUDE) when groups expire or on shutdown.
+2. **Multicast group management** — For each discovered address, computes the Solicited-Node multicast address (`ff02::1:ffXX:XXXX`) and joins the group on the upstream interface via `IPV6_JOIN_GROUP`. The kernel automatically sends MLD Reports when joining/leaving groups and responds to MLD Queries. Tracks address freshness and expires stale entries after `ADDR_TIMEOUT` (300s).
 
-Key constants are defined at module level: `ADDR_TIMEOUT`, `REFRESH_INTERVAL`, `EXPIRY_CHECK_INTERVAL`.
+Key constants are defined at module level: `ADDR_TIMEOUT`, `EXPIRY_CHECK_INTERVAL`.
