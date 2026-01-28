@@ -27,12 +27,18 @@ ICMPV6_NA = 136
 # Solicited-Node prefix
 SOLICITED_NODE_PREFIX = b'\xff\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\xff'
 
+# ICMP6_FILTER socket option (not exposed in Python's socket module)
+ICMP6_FILTER = 1
+
 # Address expiry timeout (seconds)
 # Addresses not seen in NDP traffic for this duration are considered stale.
 ADDR_TIMEOUT = 300
 
 # Expiry check interval (seconds)
 EXPIRY_CHECK_INTERVAL = 30
+
+# select() timeout for the main loop (seconds)
+SELECT_TIMEOUT = 1.0
 
 
 def solicited_node_addr_from_bytes(addr_bytes):
@@ -70,7 +76,7 @@ class MLDProxy:
         for t in (ICMPV6_NS, ICMPV6_NA):
             icmp6_filter[t // 8] |= (1 << (t % 8))
         icmp6_filter = bytes(b ^ 0xff for b in icmp6_filter)
-        self.ndp_sock.setsockopt(socket.IPPROTO_ICMPV6, 1, icmp6_filter)
+        self.ndp_sock.setsockopt(socket.IPPROTO_ICMPV6, ICMP6_FILTER, icmp6_filter)
 
         print(f"MLD Proxy: {downstream_if} -> {upstream_if}")
 
@@ -105,6 +111,8 @@ class MLDProxy:
 
         # New Solicited-Node group
         join_sock = self.kernel_join(sn)
+        if join_sock is None:
+            return
         self.joined_groups[sn] = ({target_addr: now}, join_sock)
 
     def expire_stale(self):
@@ -121,12 +129,24 @@ class MLDProxy:
                 del addrs[addr]
 
             # If no addresses remain, leave the group
-            # Kernel sends MLD Leave automatically when socket is closed
             if not addrs:
-                print(f"Left: {format_ipv6(sn)} on {self.upstream_if}")
-                if join_sock:
-                    join_sock.close()
+                self._leave_group(sn, join_sock)
                 del self.joined_groups[sn]
+
+    def _leave_group(self, sn_addr, join_sock):
+        """Leave a multicast group by closing its socket.
+
+        Kernel sends MLD Leave automatically when the socket is closed.
+        """
+        print(f"Left: {format_ipv6(sn_addr)} on {self.upstream_if}")
+        join_sock.close()
+
+    def close(self):
+        """Clean up all sockets"""
+        for sn, (_, join_sock) in self.joined_groups.items():
+            self._leave_group(sn, join_sock)
+        self.joined_groups.clear()
+        self.ndp_sock.close()
 
     def handle_ndp(self, data):
         """Handle received NDP message (NS or NA)"""
@@ -148,7 +168,7 @@ class MLDProxy:
 
         try:
             while True:
-                readable, _, _ = select.select([self.ndp_sock], [], [], 1.0)
+                readable, _, _ = select.select([self.ndp_sock], [], [], SELECT_TIMEOUT)
                 if self.ndp_sock in readable:
                     data, _ = self.ndp_sock.recvfrom(4096)
                     self.handle_ndp(data)
@@ -161,11 +181,7 @@ class MLDProxy:
 
         except KeyboardInterrupt:
             print("\nShutting down...")
-            # Kernel sends MLD Leave automatically when sockets are closed
-            for sn, (_, join_sock) in self.joined_groups.items():
-                print(f"Left: {format_ipv6(sn)}")
-                if join_sock:
-                    join_sock.close()
+            self.close()
 
 
 def main():
