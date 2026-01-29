@@ -1,23 +1,27 @@
 # mld_proxy.py
 
-Solicited-Node マルチキャストアドレス用の軽量な MLD proxy。
+NURO光のSONY NSD-G1000T(S)配下に設置されたUDM-Proにおいて、Single Network設定したIPv6環境で、IPv6通信を維持するスクリプト
 
 ## 背景
 
-IPv6 ルーターで WAN の /64 prefix を LAN に配布し、ndppd で NDP proxy を行う構成において、WAN Gateway が MLD Snooping を行っている場合、LAN hosts の Solicited-Node マルチキャストアドレスに対する MLD Report が WAN 側に送信されないため、Gateway が NS を転送せず、一定時間後に Neighbor Discovery が失敗する問題がある。
+UDM-Pro で WAN に /64 prefix が RA 配布されているとき、 SLAAC + Single Network の設定を行うことで、 LAN 側に WAN と同一の prefix を使った IPv6 ネットワークを構成できる。このとき内部的には ndppd で NDP proxy が行われており、 WAN Gateway からの NS が LAN 側ホストに到達し、ホストからの NA によって WAN Gateway の NDP キャッシュの有効期限が更新されることが期待されている。
 
-本スクリプトは、LAN 側の NDP トラフィック (NS/NA) を監視し、LAN hosts の IPv6 アドレスに対応する Solicited-Node マルチキャストグループに WAN 側で参加することで、この問題を解決する。
+通常、 WAN Gateway からの NS は Solicited-Node マルチキャストアドレスに送出される。仕様上、マルチキャストパケットは端末のすべてのポートに対して送出されるが、このとき WAN Gateway が MLD Snooping を行っていた場合、パケットは Solicited-Node マルチキャストグループに参加しているホストが存在するポートにのみ送出される。
+
+一方 UDM-Pro では、 LAN 側ホストの Solicited-Node マルチキャストグループへの参加や、対応する MLD Report は LAN 内で完結し、 WAN 側には転送されていない。このため、 WAN ネットワークにはマルチキャストグループが存在しないとみなされ、 WAN Gateway は NS を送出することなく、一定時間後に NDP キャッシュが破棄され、通信が行えなくなるという問題がある。
+
+本スクリプトは、LAN 側の NDP トラフィック (NS/NA) を監視し、 WAN 側において LAN 側ホストの IPv6 アドレスに対応する Solicited-Node マルチキャストグループに参加することで、 WAN Gateway から UDM-Pro に対して NS が送出されるようにし、この問題を解決する。
 
 ## ネットワーク構成
 
 ```
-[WAN Gateway]  MLD Snooping 有効
+[WAN Gateway]  MLD Snooping 有効 (SONY NSD-G1000TS など)
       |
    [eth9]      WAN (upstream)
       |
-  [Linux Router]  ndppd で NDP proxy
+  [UDM Pro]    ndppd で NDP proxy
       |
-    [br0]       LAN (downstream)
+    [br0]      LAN (downstream)
       |
  [LAN hosts]   SLAAC でアドレス取得
 ```
@@ -26,24 +30,23 @@ IPv6 ルーターで WAN の /64 prefix を LAN に配布し、ndppd で NDP pro
 
 UDM-Pro の管理画面で、Internet (WAN1) の IPv6 Configuration を以下のように設定する:
 
-- **IPv6 Connection**: SLAAC
-- **Prefix Delegation Size**: Single Network
-- **Assign to Network**: Default (または使用する Network)
+- **Connection**: SLAAC + Single Network
+- **Network**: Default (または使用する Network)
 
-この設定により、UDM-Pro 内蔵の NDP Proxy (ndppd) が有効になり、NS/NA が WAN と選択した Network の間で転送される。クライアントは SLAAC で WAN 側と同一 prefix のアドレスを取得できる。
+この設定により、UDM-Pro 内蔵の NDP Proxy (ndppd) が有効になり、 NS/NA が WAN と選択した Network の間で転送される。クライアントは SLAAC で WAN 側と同一 prefix のアドレスを取得できる。
 
 ### MLD Snooping による問題
 
 NDP Proxy だけでは、Network 側でクライアントが参加する Solicited-Node マルチキャストアドレスに、WAN 側では誰も参加していない状態となる。
 
-WAN Gateway が MLD Snooping を行っている場合（SONY NURO 光 NSD-G1000T など）、以下の問題が発生する:
+WAN Gateway が MLD Snooping を行っている場合、以下の問題が発生する:
 
 1. WAN Gateway が NDP キャッシュを更新するために Solicited-Node マルチキャストアドレス宛に NS を送信
 2. MLD Snooping により、そのマルチキャストグループのメンバーがいないため NS がどこにも転送されない
 3. NS が届かないため NA が返らず、WAN Gateway の NDP キャッシュからエントリが削除される
 4. 結果として通信が途絶える
 
-### 本スクリプトによる解決
+### 本スクリプトが行うこと
 
 本スクリプトは Network 側での DAD/NA を監視し、対応する Solicited-Node マルチキャストグループに WAN 側で参加する。これにより:
 
@@ -53,30 +56,25 @@ WAN Gateway が MLD Snooping を行っている場合（SONY NURO 光 NSD-G1000T
 
 ## 動作原理
 
-1. br0 上の NS (DAD を含む) と NA を raw socket で監視
-2. LAN hosts の IPv6 アドレスから Solicited-Node マルチキャストアドレス (`ff02::1:ffXX:XXXX`) を算出
-3. eth9 でそのマルチキャストグループにカーネルレベルで参加 (`IPV6_JOIN_GROUP`)
-4. カーネルが自動的に MLDv2 Report を送信し、MLD Query にも応答する
+1. LAN 上の NS (DAD を含む) と NA を raw socket で監視
+2. LAN 側ホストの IPv6 アドレスから Solicited-Node マルチキャストアドレス (`ff02::1:ffXX:XXXX`) を算出
+3. WAN でそのマルチキャストグループに参加 (`IPV6_JOIN_GROUP`)
+4. Kernel が自動的に MLDv2 Report を送信し、MLD Query にも応答する
 
-これにより、WAN Gateway は eth9 を該当グループのメンバーとして認識し、NS を eth9 に転送する。ndppd がその NS を受信して NA を返すことで、LAN hosts の Neighbor Discovery が正常に機能する。
-
-## 前提条件
-
-- Python 3.6 以上
-- root 権限
-- ndppd が動作していること
-- `CONFIG_IPV6_MROUTE` は不要
+これにより、WAN Gateway は UDM-Pro の WAN 側インターフェースを該当グループのメンバーとして認識し、 NS を UDM-Pro に転送する。 ndppd がその NS を受信して NA を返すことで、 LAN 側ホストの Neighbor Discovery が正常に機能する。
 
 ## 使い方
 
 ```
-sudo python3 mld_proxy.py <upstream_if> <downstream_if>
+python3 mld_proxy.py <upstream_if> <downstream_if>
 ```
+
+(要root)
 
 ### 例
 
 ```
-sudo python3 mld_proxy.py eth9 br0
+python3 mld_proxy.py eth9 br0
 ```
 
 ### 出力例
@@ -86,27 +84,6 @@ MLD Proxy: br0 -> eth9
 Listening for NDP on downstream...
 Joined: ff02::1:ff12:3456 on eth9
 Joined: ff02::1:ff78:9abc on eth9
-```
-
-## systemd でのデーモン化
-
-```ini
-# /etc/systemd/system/mld-proxy.service
-[Unit]
-Description=MLD Proxy for Solicited-Node Multicast
-After=network.target ndppd.service
-
-[Service]
-ExecStart=/usr/bin/python3 /path/to/mld_proxy.py eth9 br0
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```
-sudo systemctl enable --now mld-proxy.service
 ```
 
 ## タイマー
@@ -135,7 +112,7 @@ curl -fsL "https://raw.githubusercontent.com/unifi-utilities/unifios-utilities/H
 ```bash
 # スクリプトを /data に配置
 mkdir -p /data/mld-proxy
-curl -o /data/mld-proxy/mld_proxy.py https://raw.githubusercontent.com/<your-repo>/mld_proxy.py
+curl -o /data/mld-proxy/mld_proxy.py https://raw.githubusercontent.com/tnj/udm-pro-mld-proxy/mld_proxy.py
 chmod +x /data/mld-proxy/mld_proxy.py
 ```
 
@@ -194,23 +171,4 @@ ip link show
 
 ### 注意事項
 
-- `/data` ディレクトリはファームウェア更新後も保持される
-- on-boot-script は UniFi OS コンテナ起動後に実行されるため、ネットワークインターフェースは利用可能な状態
 - ファームウェアのメジャーアップデート後は on-boot-script の再インストールが必要な場合がある
-
-### トラブルシューティング
-
-```bash
-# サービスの状態確認
-systemctl status udm-boot
-
-# on-boot-script のログ確認
-journalctl -u udm-boot
-
-# MLD Proxy を手動停止
-kill "$(cat /run/mld-proxy.pid)"
-```
-
-## 制限事項
-
-- link-local アドレス (`fe80::/10`) は対象外（Solicited-Node の proxy は不要なため）
