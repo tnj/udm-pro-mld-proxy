@@ -14,11 +14,14 @@ Usage: sudo python3 mld_proxy.py <upstream_if> <downstream_if>
 Example: sudo python3 mld_proxy.py eth9 br0
 """
 
+import logging
 import socket
 import struct
 import sys
 import select
 import time
+
+logger = logging.getLogger("mld-proxy")
 
 # ICMPv6 types
 ICMPV6_NS = 135
@@ -32,7 +35,7 @@ ICMP6_FILTER = 1
 
 # Address expiry timeout (seconds)
 # Addresses not seen in NDP traffic for this duration are considered stale.
-ADDR_TIMEOUT = 300
+ADDR_TIMEOUT = 1800
 
 # Expiry check interval (seconds)
 EXPIRY_CHECK_INTERVAL = 30
@@ -78,7 +81,7 @@ class MLDProxy:
         icmp6_filter = bytes(b ^ 0xff for b in icmp6_filter)
         self.ndp_sock.setsockopt(socket.IPPROTO_ICMPV6, ICMP6_FILTER, icmp6_filter)
 
-        print(f"MLD Proxy: {downstream_if} -> {upstream_if}")
+        logger.info("MLD Proxy: %s -> %s", downstream_if, upstream_if)
 
     def kernel_join(self, sn_addr):
         """Join multicast group at kernel level.
@@ -90,10 +93,10 @@ class MLDProxy:
             sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
             mreq = sn_addr + struct.pack("I", self.upstream_idx)
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
-            print(f"Joined: {format_ipv6(sn_addr)} on {self.upstream_if}")
+            logger.info("Joined: %s on %s", format_ipv6(sn_addr), self.upstream_if)
             return sock
         except OSError as e:
-            print(f"Failed to join {format_ipv6(sn_addr)}: {e}")
+            logger.error("Failed to join %s: %s", format_ipv6(sn_addr), e)
             return None
 
     def add_address(self, target_addr):
@@ -125,7 +128,7 @@ class MLDProxy:
             # Remove expired addresses
             expired = [addr for addr, ts in addrs.items() if now - ts >= ADDR_TIMEOUT]
             for addr in expired:
-                print(f"Expired: {format_ipv6(addr)}")
+                logger.info("Expired: %s", format_ipv6(addr))
                 del addrs[addr]
 
             # If no addresses remain, leave the group
@@ -138,7 +141,7 @@ class MLDProxy:
 
         Kernel sends MLD Leave automatically when the socket is closed.
         """
-        print(f"Left: {format_ipv6(sn_addr)} on {self.upstream_if}")
+        logger.info("Left: %s on %s", format_ipv6(sn_addr), self.upstream_if)
         join_sock.close()
 
     def close(self):
@@ -162,7 +165,7 @@ class MLDProxy:
 
     def run(self):
         """Main loop"""
-        print("Listening for NDP on downstream...")
+        logger.info("Listening for NDP on downstream...")
 
         last_expiry_check = time.time()
 
@@ -180,7 +183,7 @@ class MLDProxy:
                     last_expiry_check = now
 
         except KeyboardInterrupt:
-            print("\nShutting down...")
+            logger.info("Shutting down...")
             self.close()
 
 
@@ -192,6 +195,11 @@ def main():
 
     upstream_if = sys.argv[1]
     downstream_if = sys.argv[2]
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     proxy = MLDProxy(upstream_if, downstream_if)
     proxy.run()
