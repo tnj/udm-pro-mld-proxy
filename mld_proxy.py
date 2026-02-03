@@ -6,6 +6,10 @@ Monitors NDP (NS/NA) on the downstream interface (br0) to discover
 LAN hosts' IPv6 addresses, and joins the corresponding Solicited-Node
 multicast groups on the upstream interface (eth9).
 
+Additionally, periodically scans the kernel's neighbor table via Netlink
+to maintain multicast group membership for hosts that remain in the
+neighbor cache (even in STALE state), preventing premature group leaves.
+
 The kernel automatically sends MLD Reports when joining groups,
 which allows NDP to work through a router when the upstream gateway
 performs MLD Snooping.
@@ -23,6 +27,26 @@ import time
 
 logger = logging.getLogger("mld-proxy")
 
+# Netlink constants
+NETLINK_ROUTE = 0
+RTM_GETNEIGH = 30
+RTM_NEWNEIGH = 28
+NLM_F_REQUEST = 0x01
+NLM_F_DUMP = 0x300
+NLMSG_DONE = 3
+NLMSG_ERROR = 2
+
+# Neighbor Discovery Attribute types
+NDA_DST = 1
+
+# Neighbor states (valid states for our purposes)
+NUD_REACHABLE = 0x02
+NUD_STALE = 0x04
+NUD_DELAY = 0x08
+NUD_PROBE = 0x10
+NUD_PERMANENT = 0x80
+NUD_VALID_STATES = (NUD_REACHABLE, NUD_STALE, NUD_DELAY, NUD_PROBE, NUD_PERMANENT)
+
 # ICMPv6 types
 ICMPV6_NS = 135
 ICMPV6_NA = 136
@@ -34,14 +58,97 @@ SOLICITED_NODE_PREFIX = b'\xff\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\xff'
 ICMP6_FILTER = 1
 
 # Address expiry timeout (seconds)
-# Addresses not seen in NDP traffic for this duration are considered stale.
+# Addresses not seen in NDP traffic or neighbor table for this duration are
+# considered stale.
 ADDR_TIMEOUT = 1800
 
 # Expiry check interval (seconds)
 EXPIRY_CHECK_INTERVAL = 30
 
+# Neighbor table scan interval (seconds)
+NEIGHBOR_SCAN_INTERVAL = 60
+
 # select() timeout for the main loop (seconds)
 SELECT_TIMEOUT = 1.0
+
+
+def get_ipv6_neighbors(ifindex):
+    """Get IPv6 neighbor addresses for a specific interface using Netlink.
+
+    Returns a list of 16-byte IPv6 addresses that are in valid states
+    (REACHABLE, STALE, DELAY, PROBE, or PERMANENT).
+    """
+    sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, NETLINK_ROUTE)
+    sock.bind((0, 0))
+
+    try:
+        # Build RTM_GETNEIGH request
+        # struct ndmsg: family(1) + pad(3) + ifindex(4) + state(2) + flags(1) + type(1)
+        ndmsg = struct.pack("BxxxiHBB", socket.AF_INET6, ifindex, 0, 0, 0)
+
+        # struct nlmsghdr: len(4) + type(2) + flags(2) + seq(4) + pid(4)
+        nlmsg_len = 16 + len(ndmsg)
+        nlmsghdr = struct.pack(
+            "IHHII", nlmsg_len, RTM_GETNEIGH, NLM_F_REQUEST | NLM_F_DUMP, 1, 0
+        )
+
+        sock.send(nlmsghdr + ndmsg)
+
+        neighbors = []
+
+        while True:
+            data = sock.recv(65536)
+            offset = 0
+
+            while offset < len(data):
+                # Parse nlmsghdr
+                if offset + 16 > len(data):
+                    break
+
+                nlmsg_len, nlmsg_type, _, _, _ = struct.unpack_from(
+                    "IHHII", data, offset
+                )
+
+                if nlmsg_type == NLMSG_DONE:
+                    return neighbors
+
+                if nlmsg_type == NLMSG_ERROR:
+                    return neighbors
+
+                if nlmsg_type == RTM_NEWNEIGH:
+                    # Parse ndmsg (12 bytes after nlmsghdr)
+                    ndmsg_offset = offset + 16
+                    if ndmsg_offset + 12 <= len(data):
+                        family, nd_ifindex, state, _, _ = struct.unpack_from(
+                            "BxxxiHBB", data, ndmsg_offset
+                        )
+
+                        if family == socket.AF_INET6 and nd_ifindex == ifindex:
+                            # Parse attributes to find NDA_DST
+                            attr_offset = ndmsg_offset + 12
+
+                            while attr_offset + 4 <= offset + nlmsg_len:
+                                rta_len, rta_type = struct.unpack_from(
+                                    "HH", data, attr_offset
+                                )
+                                if rta_len < 4:
+                                    break
+
+                                if rta_type == NDA_DST and rta_len >= 4 + 16:
+                                    dst_addr = data[attr_offset + 4 : attr_offset + 4 + 16]
+                                    if state in NUD_VALID_STATES:
+                                        neighbors.append(dst_addr)
+                                    break
+
+                                # Align to 4 bytes
+                                attr_offset += (rta_len + 3) & ~3
+
+                # Move to next message (aligned to 4 bytes)
+                offset += (nlmsg_len + 3) & ~3
+
+        return neighbors
+    finally:
+        sock.close()
 
 
 def solicited_node_addr_from_bytes(addr_bytes):
@@ -64,6 +171,7 @@ class MLDProxy:
         self.upstream_if = upstream_if
         self.downstream_if = downstream_if
         self.upstream_idx = socket.if_nametoindex(upstream_if)
+        self.downstream_idx = socket.if_nametoindex(downstream_if)
 
         # Track joined Solicited-Node addresses:
         #   sn_addr_bytes -> (dict of {target_addr_bytes: last_seen_time}, join_socket)
@@ -118,6 +226,39 @@ class MLDProxy:
             return
         self.joined_groups[sn] = ({target_addr: now}, join_sock)
 
+    def scan_neighbor_table(self):
+        """Scan kernel neighbor table and refresh timestamps for known addresses.
+
+        This prevents premature group leaves for hosts that remain in the
+        neighbor cache even if they're not actively sending NDP messages.
+        """
+        neighbors = get_ipv6_neighbors(self.downstream_idx)
+        logger.debug("Found %d neighbors in table", len(neighbors))
+
+        refreshed = 0
+        added = 0
+        for addr in neighbors:
+            if is_link_local(addr):
+                continue
+
+            sn = solicited_node_addr_from_bytes(addr)
+            if sn in self.joined_groups:
+                addrs, _ = self.joined_groups[sn]
+                if addr in addrs:
+                    addrs[addr] = time.time()
+                    refreshed += 1
+                else:
+                    # Same SN group but different address - add it
+                    self.add_address(addr)
+                    added += 1
+            else:
+                # New address not yet tracked - add it
+                self.add_address(addr)
+                added += 1
+
+        if refreshed > 0 or added > 0:
+            logger.debug("Neighbor scan: refreshed=%d, added=%d", refreshed, added)
+
     def expire_stale(self):
         """Remove addresses not seen recently and leave empty groups"""
         now = time.time()
@@ -168,6 +309,10 @@ class MLDProxy:
         logger.info("Listening for NDP on downstream...")
 
         last_expiry_check = time.time()
+        last_neighbor_scan = time.time()
+
+        # Initial neighbor table scan to pick up existing hosts
+        self.scan_neighbor_table()
 
         try:
             while True:
@@ -177,6 +322,10 @@ class MLDProxy:
                     self.handle_ndp(data)
 
                 now = time.time()
+
+                if now - last_neighbor_scan >= NEIGHBOR_SCAN_INTERVAL:
+                    self.scan_neighbor_table()
+                    last_neighbor_scan = now
 
                 if now - last_expiry_check >= EXPIRY_CHECK_INTERVAL:
                     self.expire_stale()
