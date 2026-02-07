@@ -86,12 +86,36 @@ Joined: ff02::1:ff12:3456 on eth9
 Joined: ff02::1:ff78:9abc on eth9
 ```
 
+## ルート優先度の自動調整
+
+UDM-Pro の Single Network 構成では、WAN (eth9) と LAN (br0) に同一の IPv6 prefix が同じ metric で設定されることがある:
+
+```
+2001:db8:abcd::/64 dev eth9 proto ra metric 256
+2001:db8:abcd::/64 dev br0 proto kernel metric 256
+```
+
+この状態で一部の Android 端末などで NUD (Neighbor Unreachability Detection) が失敗すると、br0 側のルートが消失し、UDM-Pro から LAN クライアントへのパケットが eth9 (WAN) に送出されてしまう問題がある。
+
+本スクリプトは起動時および定期的にルーティングテーブルをチェックし、upstream と downstream で同一 prefix/metric のルートが存在する場合、downstream 側により低い metric のルートを自動的に追加する:
+
+```
+2001:db8:abcd::/64 dev br0 metric 128           ← 自動追加
+2001:db8:abcd::/64 dev eth9 proto ra metric 256
+2001:db8:abcd::/64 dev br0 proto kernel metric 256
+```
+
+これにより、LAN 側のルートが常に優先され、パケットが正しく br0 に送出される。
+
 ## タイマー
 
 | パラメータ | デフォルト | 説明 |
 |-----------|-----------|------|
-| `ADDR_TIMEOUT` | 300 秒 | NDP トラフィックが観測されないアドレスを期限切れとする時間 |
+| `ADDR_TIMEOUT` | 1800 秒 | NDP トラフィックが観測されないアドレスを期限切れとする時間 |
 | `EXPIRY_CHECK_INTERVAL` | 30 秒 | 期限切れチェックの実行間隔 |
+| `NEIGHBOR_SCAN_INTERVAL` | 60 秒 | Neighbor テーブルスキャンの実行間隔 |
+| `ROUTE_CHECK_INTERVAL` | 300 秒 | ルート優先度チェックの実行間隔 |
+| `ROUTE_METRIC_DIVISOR` | 2 | 新しい metric = 元の metric / この値 |
 
 ## UniFi Dream Machine Pro でのデーモン化
 

@@ -19,8 +19,10 @@ Example: sudo python3 mld_proxy.py eth9 br0
 """
 
 import logging
+import re
 import socket
 import struct
+import subprocess
 import sys
 import select
 import time
@@ -70,6 +72,13 @@ NEIGHBOR_SCAN_INTERVAL = 60
 
 # select() timeout for the main loop (seconds)
 SELECT_TIMEOUT = 1.0
+
+# Route metric adjustment: new metric will be original / ROUTE_METRIC_DIVISOR
+ROUTE_METRIC_DIVISOR = 2
+
+# Route priority check interval (seconds)
+# RA may re-add routes with the original metric, so we check periodically
+ROUTE_CHECK_INTERVAL = 300
 
 
 def get_ipv6_neighbors(ifindex):
@@ -166,6 +175,126 @@ def is_link_local(addr_bytes):
     return addr_bytes[0] == 0xfe and (addr_bytes[1] & 0xc0) == 0x80
 
 
+def get_ipv6_routes():
+    """Get IPv6 routes from the kernel routing table.
+
+    Returns a list of dicts with keys: prefix, dev, metric, proto
+    """
+    try:
+        result = subprocess.run(
+            ["ip", "-6", "route", "show"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logger.warning("Failed to get IPv6 routes: %s", e)
+        return []
+
+    routes = []
+
+    for line in result.stdout.splitlines():
+        # Skip default routes and link-local
+        if line.startswith("default") or line.startswith("fe80:"):
+            continue
+
+        # Parse prefix and dev (required)
+        prefix_match = re.match(r"^(\S+)\s+dev\s+(\S+)", line)
+        if not prefix_match:
+            continue
+
+        prefix, dev = prefix_match.groups()
+
+        # Extract metric (optional, search anywhere in line)
+        metric_match = re.search(r"metric\s+(\d+)", line)
+        metric = int(metric_match.group(1)) if metric_match else 0
+
+        # Extract proto (optional)
+        proto_match = re.search(r"proto\s+(\S+)", line)
+        proto = proto_match.group(1) if proto_match else ""
+
+        routes.append({
+            "prefix": prefix,
+            "dev": dev,
+            "metric": metric,
+            "proto": proto,
+        })
+
+    return routes
+
+
+def fix_route_priority(upstream_if, downstream_if):
+    """Fix route priority when upstream and downstream have the same prefix/metric.
+
+    If both interfaces have routes to the same prefix with the same metric,
+    add a higher-priority route (lower metric) for the downstream interface.
+    """
+    routes = get_ipv6_routes()
+
+    # Group routes by prefix
+    routes_by_prefix = {}
+    for route in routes:
+        prefix = route["prefix"]
+        if prefix not in routes_by_prefix:
+            routes_by_prefix[prefix] = []
+        routes_by_prefix[prefix].append(route)
+
+    for prefix, prefix_routes in routes_by_prefix.items():
+        upstream_route = None
+        downstream_route = None
+
+        for route in prefix_routes:
+            if route["dev"] == upstream_if:
+                upstream_route = route
+            elif route["dev"] == downstream_if:
+                downstream_route = route
+
+        if upstream_route and downstream_route:
+            if upstream_route["metric"] == downstream_route["metric"]:
+                original_metric = downstream_route["metric"]
+                new_metric = max(1, original_metric // ROUTE_METRIC_DIVISOR)
+
+                # Check if a better route already exists
+                has_better_route = any(
+                    r["dev"] == downstream_if and r["metric"] < original_metric
+                    for r in prefix_routes
+                )
+                if has_better_route:
+                    logger.debug(
+                        "Route %s dev %s already has better metric, skipping",
+                        prefix,
+                        downstream_if,
+                    )
+                    continue
+
+                logger.info(
+                    "Fixing route priority: %s dev %s metric %d -> %d",
+                    prefix,
+                    downstream_if,
+                    original_metric,
+                    new_metric,
+                )
+
+                try:
+                    subprocess.run(
+                        [
+                            "ip", "-6", "route", "add",
+                            prefix, "dev", downstream_if, "metric", str(new_metric),
+                        ],
+                        capture_output=True,
+                        check=True,
+                    )
+                except subprocess.CalledProcessError as e:
+                    # Route may already exist
+                    if b"File exists" not in e.stderr:
+                        logger.warning(
+                            "Failed to add route %s dev %s: %s",
+                            prefix,
+                            downstream_if,
+                            e.stderr.decode().strip(),
+                        )
+
+
 class MLDProxy:
     def __init__(self, upstream_if, downstream_if):
         self.upstream_if = upstream_if
@@ -190,6 +319,9 @@ class MLDProxy:
         self.ndp_sock.setsockopt(socket.IPPROTO_ICMPV6, ICMP6_FILTER, icmp6_filter)
 
         logger.info("MLD Proxy: %s -> %s", downstream_if, upstream_if)
+
+        # Fix route priority if upstream and downstream have same prefix/metric
+        fix_route_priority(upstream_if, downstream_if)
 
     def kernel_join(self, sn_addr):
         """Join multicast group at kernel level.
@@ -310,6 +442,7 @@ class MLDProxy:
 
         last_expiry_check = time.time()
         last_neighbor_scan = time.time()
+        last_route_check = time.time()
 
         # Initial neighbor table scan to pick up existing hosts
         self.scan_neighbor_table()
@@ -330,6 +463,10 @@ class MLDProxy:
                 if now - last_expiry_check >= EXPIRY_CHECK_INTERVAL:
                     self.expire_stale()
                     last_expiry_check = now
+
+                if now - last_route_check >= ROUTE_CHECK_INTERVAL:
+                    fix_route_priority(self.upstream_if, self.downstream_if)
+                    last_route_check = now
 
         except KeyboardInterrupt:
             logger.info("Shutting down...")
