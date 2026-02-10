@@ -14,11 +14,14 @@ The kernel automatically sends MLD Reports when joining groups,
 which allows NDP to work through a router when the upstream gateway
 performs MLD Snooping.
 
-Usage: sudo python3 mld_proxy.py <upstream_if> <downstream_if>
+Usage: sudo python3 mld_proxy.py <upstream_if> <downstream_if> [--fix-ndppd-ttl]
 Example: sudo python3 mld_proxy.py eth9 br0
+         sudo python3 mld_proxy.py eth9 br0 --fix-ndppd-ttl
 """
 
+import argparse
 import logging
+import os
 import re
 import socket
 import struct
@@ -79,6 +82,10 @@ ROUTE_METRIC_DIVISOR = 2
 # Route priority check interval (seconds)
 # RA may re-add routes with the original metric, so we check periodically
 ROUTE_CHECK_INTERVAL = 300
+
+# ndppd TTL configuration
+NDPPD_TTL_DEFAULT = 30000
+NDPPD_TTL_EXTENDED = 3600000
 
 
 def get_ipv6_neighbors(ifindex):
@@ -295,6 +302,78 @@ def fix_route_priority(upstream_if, downstream_if):
                         )
 
 
+def fix_ndppd_ttl(downstream_if, upstream_if):
+    """Fix ndppd TTL configuration to extend session timeout.
+
+    Modifies /run/ndppd_{downstream}_{upstream}.conf to change
+    'ttl 30000' to 'ttl 3600000' to work around Ubiquiti U7 series
+    multicast issues that cause Android devices to miss NS packets.
+
+    Returns True if the config was modified and ndppd needs restart.
+    """
+    config_path = f"/run/ndppd_{downstream_if}_{upstream_if}.conf"
+
+    if not os.path.exists(config_path):
+        logger.warning("ndppd config not found: %s", config_path)
+        return False
+
+    try:
+        with open(config_path, "r") as f:
+            content = f.read()
+    except OSError as e:
+        logger.error("Failed to read ndppd config: %s", e)
+        return False
+
+    # Check if TTL is already extended
+    if f"ttl {NDPPD_TTL_EXTENDED}" in content:
+        logger.info("ndppd TTL already extended in %s", config_path)
+        return False
+
+    # Replace TTL value
+    new_content, count = re.subn(
+        rf"\bttl\s+{NDPPD_TTL_DEFAULT}\b",
+        f"ttl {NDPPD_TTL_EXTENDED}",
+        content,
+    )
+
+    if count == 0:
+        logger.warning(
+            "TTL pattern 'ttl %d' not found in %s",
+            NDPPD_TTL_DEFAULT,
+            config_path,
+        )
+        return False
+
+    try:
+        with open(config_path, "w") as f:
+            f.write(new_content)
+        logger.info(
+            "Updated ndppd TTL: %d -> %d in %s",
+            NDPPD_TTL_DEFAULT,
+            NDPPD_TTL_EXTENDED,
+            config_path,
+        )
+        return True
+    except OSError as e:
+        logger.error("Failed to write ndppd config: %s", e)
+        return False
+
+
+def restart_ndppd():
+    """Restart ndppd to apply configuration changes.
+
+    Sends SIGTERM to ndppd. On UDM Pro, ubios-udapi-server will
+    automatically restart ndppd after it exits.
+    """
+    try:
+        subprocess.run(["pkill", "-x", "ndppd"], capture_output=True)
+        logger.info("Sent SIGTERM to ndppd (ubios-udapi-server will restart it)")
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logger.warning("Failed to send SIGTERM to ndppd: %s", e)
+        return False
+
+
 class MLDProxy:
     def __init__(self, upstream_if, downstream_if):
         self.upstream_if = upstream_if
@@ -474,20 +553,46 @@ class MLDProxy:
 
 
 def main():
-    if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <upstream_if> <downstream_if>")
-        print(f"Example: {sys.argv[0]} eth9 br0")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="MLD Proxy for Solicited-Node Multicast Addresses",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Example:
+  sudo python3 mld_proxy.py eth9 br0
+  sudo python3 mld_proxy.py eth9 br0 --fix-ndppd-ttl
+""",
+    )
+    parser.add_argument(
+        "upstream_if",
+        help="Upstream interface (e.g., eth9)",
+    )
+    parser.add_argument(
+        "downstream_if",
+        help="Downstream interface (e.g., br0)",
+    )
+    parser.add_argument(
+        "--fix-ndppd-ttl",
+        action="store_true",
+        help=(
+            f"Extend ndppd TTL from {NDPPD_TTL_DEFAULT}ms to {NDPPD_TTL_EXTENDED}ms "
+            "to work around Ubiquiti U7 multicast issues. "
+            "Restarts ndppd if config is modified."
+        ),
+    )
 
-    upstream_if = sys.argv[1]
-    downstream_if = sys.argv[2]
+    args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    proxy = MLDProxy(upstream_if, downstream_if)
+    if args.fix_ndppd_ttl:
+        modified = fix_ndppd_ttl(args.downstream_if, args.upstream_if)
+        if modified:
+            restart_ndppd()
+
+    proxy = MLDProxy(args.upstream_if, args.downstream_if)
     proxy.run()
 
 

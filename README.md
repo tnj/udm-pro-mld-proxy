@@ -66,15 +66,25 @@ WAN Gateway が MLD Snooping を行っている場合、以下の問題が発生
 ## 使い方
 
 ```
-python3 mld_proxy.py <upstream_if> <downstream_if>
+python3 mld_proxy.py <upstream_if> <downstream_if> [--fix-ndppd-ttl]
 ```
 
 (要root)
 
+### オプション
+
+| オプション | 説明 |
+|-----------|------|
+| `--fix-ndppd-ttl` | ndppd の TTL を 30秒 から 3600秒 に延長し、ndppd を再起動する |
+
 ### 例
 
-```
+```bash
+# 基本的な使い方
 python3 mld_proxy.py eth9 br0
+
+# ndppd TTL 修正付き
+python3 mld_proxy.py eth9 br0 --fix-ndppd-ttl
 ```
 
 ### 出力例
@@ -106,6 +116,18 @@ UDM-Pro の Single Network 構成では、WAN (eth9) と LAN (br0) に同一の 
 ```
 
 これにより、LAN 側のルートが常に優先され、パケットが正しく br0 に送出される。
+
+## ndppd TTL の延長 (Ubiquiti U7 対策)
+
+Ubiquiti U7 シリーズの AP にはマルチキャストが正常に転送されない不具合があり、Android 端末などが NS (Neighbor Solicitation) を受け取れないことがある。この場合、ndppd のセッションが更新されず、upstream に NA を返さなくなり通信が途絶える。
+
+`--fix-ndppd-ttl` オプションを使用すると、ndppd の設定ファイル (`/run/ndppd_{downstream}_{upstream}.conf`) の TTL を 30秒 (30000ms) から 3600秒 (3600000ms) に延長する。これにより:
+
+1. ndppd のセッション有効期限が大幅に延長される
+2. Android 端末が NS を受け取れる機会が増える
+3. セッションが期限切れになりにくくなり、通信が安定する
+
+設定ファイルが変更された場合、ndppd は自動的に再起動される (ubios-udapi-server が再起動を管理)。
 
 ## タイマー
 
@@ -158,8 +180,8 @@ if [ -f "$PID_FILE" ]; then
     rm -f "$PID_FILE"
 fi
 
-# バックグラウンドで起動
-nohup python3 "$SCRIPT_PATH" "$UPSTREAM_IF" "$DOWNSTREAM_IF" >> "$LOG_FILE" 2>&1 &
+# バックグラウンドで起動 (--fix-ndppd-ttl は Ubiquiti U7 環境で推奨)
+nohup python3 "$SCRIPT_PATH" "$UPSTREAM_IF" "$DOWNSTREAM_IF" --fix-ndppd-ttl >> "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 
 echo "MLD Proxy started (PID: $(cat $PID_FILE))"
